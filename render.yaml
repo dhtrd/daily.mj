@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: restaurant-pos-fatora
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node server.js
+    envVars:
+      - key: FATORA_API_KEY
+        sync: false
+      - key: FATORA_BASE_URL
+        value: https://api.fatora.io/v1
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: NODE_ENV
+        value: production
+      # متغيّرات Firebase اختيارية — مطلوبة وقت البناء إن استخدمت Firestore
+      - key: VITE_FIREBASE_API_KEY
+        sync: false
+      - key: VITE_FIREBASE_PROJECT_ID
+        sync: false
+      - key: VITE_FIREBASE_AUTH_DOMAIN
+        sync: false
+      - key: VITE_FIREBASE_STORAGE_BUCKET
+        sync: false
+      - key: VITE_FIREBASE_SENDER_ID
+        sync: false
+      - key: VITE_FIREBASE_APP_ID
+        sync: false

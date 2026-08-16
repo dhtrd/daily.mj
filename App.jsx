@@ -136,24 +136,41 @@ export default function App() {
     if (!ok) say('تعذّر الحفظ في السحابة — حُفظ محلياً', 'no');
   }, [say]);
 
-  // كتابة الطلبات بقراءة الأحدث أولاً (يقلّل تعارض الأجهزة)
-  const commitOrders = useCallback(async (fn) => {
-    const latest = await cloud.get(KEYS.orders, dbRef.current.orders);
-    const next = fn(latest || []);
-    setDb(d => ({ ...d, orders: next }));
-    await cloud.set(KEYS.orders, next);
-    return next;
+  // كتابة الطلبات/الورديات: تُسلسَل عبر سلسلة وعود واحدة حتى لا تتداخل قراءتان-كتابتان
+  // على نفس الجهاز فتُفقد إحداهما. كل عملية تقرأ الأحدث بعد استقرار سابقتها.
+  // (تعارض الأجهزة المختلفة يبقى ممكناً — يُعالَج بدمج ذرّي على الخادم/Firestore transactions.)
+  const writeChain = useRef(Promise.resolve());
+  const commitKey = useCallback((key, field, fn) => {
+    const run = async () => {
+      const latest = await cloud.get(key, dbRef.current[field]);
+      const next = fn(latest || []);
+      setDb(d => ({ ...d, [field]: next }));
+      await cloud.set(key, next);
+      return next;
+    };
+    const p = writeChain.current.then(run, run);
+    writeChain.current = p.then(() => { }, () => { });
+    return p;
   }, []);
-  const commitShifts = useCallback(async (fn) => {
-    const latest = await cloud.get(KEYS.shifts, dbRef.current.shifts);
-    const next = fn(latest || []);
-    setDb(d => ({ ...d, shifts: next }));
-    await cloud.set(KEYS.shifts, next);
-    return next;
-  }, []);
+  const commitOrders = useCallback((fn) => commitKey(KEYS.orders, 'orders', fn), [commitKey]);
+  const commitShifts = useCallback((fn) => commitKey(KEYS.shifts, 'shifts', fn), [commitKey]);
 
   /* ============ عمليات الطلب ============ */
-  const persistOrder = useCallback((order) => commitOrders(list => upsert(list, order)), [commitOrders]);
+  // الحفظ: تحديث بالمعرّف إن كان موجوداً، وإلا إدراج جديد مع تخصيص رقم الفاتورة
+  // من أحدث قائمة وقت الحفظ (لا من الحالة المحلية وقت البدء) — يقلّص تكرار الأرقام.
+  // يعيد الطلب المحفوظ (بالرقم النهائي) لتزامن السلة معه.
+  const persistOrder = useCallback(async (order) => {
+    let saved = order;
+    await commitOrders(list => {
+      const idx = (list || []).findIndex(o => o.id === order.id);
+      // تحديث: نحافظ على الرقم/التسلسل المخصَّص وقت أول حفظ (لا يتغيّر بعد ذلك أبداً)
+      if (idx >= 0) { const c = [...list]; saved = { ...order, no: list[idx].no, seq: list[idx].seq }; c[idx] = saved; return c; }
+      const seq = nextSeq(list);
+      saved = { ...order, seq, no: 'INV-' + String(seq).padStart(5, '0') };
+      return [...(list || []), saved];
+    });
+    return saved;
+  }, [commitOrders]);
 
   const startOrder = useCallback((type, table = null) => {
     const seq = nextSeq(dbRef.current.orders);
@@ -168,10 +185,19 @@ export default function App() {
     const newlySent = (order.lines || []).filter(l => !l.sentAt);
     const lines = (order.lines || []).map(l => l.sentAt ? l : { ...l, sentAt: nowISO() });
     const t = computeOrder({ ...order, lines }, settings);
-    const paid = { ...order, lines, payments, status: 'paid', closedAt: nowISO(), shiftId: order.shiftId || openShift?.id, pendingFatora: null, totals: t };
-    await persistOrder(paid);
-    if (newlySent.length && settings.autoKitchenPrint !== false) printKitchen(paid, newlySent, settings.receiptSize);
-    return paid;
+    // لا تُغلق الفاتورة كـ«مدفوعة» إلا إذا غطّت الدفعات الإجمالي (حماية من إغلاق ناقص السداد)
+    const paidSum = (payments || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
+    const covered = paidSum >= t.total - 0.009;
+    // الوردية المفتوحة وقت الدفع هي المسؤولة عن مطابقة نقدها (لا وردية فتح الطلب)
+    const rec = {
+      ...order, lines, payments, totals: t, pendingFatora: null,
+      status: covered ? 'paid' : (lines.some(l => l.sentAt) ? 'sent' : 'held'),
+      closedAt: covered ? nowISO() : (order.closedAt || null),
+      shiftId: openShift?.id || order.shiftId
+    };
+    const saved = await persistOrder(rec);
+    if (newlySent.length && settings.autoKitchenPrint !== false) printKitchen(saved, newlySent, settings.receiptSize);
+    return saved;
   }, [settings, openShift, persistOrder]);
 
   /* ============ عودة العميل من فاتورة ============ */
@@ -186,19 +212,25 @@ export default function App() {
       const ord = latest.find(o => o.pendingFatora && o.pendingFatora.fatoraOrderId === ret.orderId);
       clearFatoraReturn();
       if (!ord) { say('تعذّر مطابقة عملية فاتورة بالطلب', 'no'); return; }
+      const reopen = (o) => commitOrders(list => list.map(x => x.id === o.id ? { ...x, pendingFatora: null, status: x.lines.some(l => l.sentAt) ? 'sent' : 'held' } : x));
       if (ret.outcome === 'failure') {
-        await commitOrders(list => upsert(list, { ...ord, pendingFatora: null, status: ord.lines.some(l => l.sentAt) ? 'sent' : 'held' }));
-        say('لم يكتمل الدفع عبر فاتورة', 'no'); loadOrder(ord); setTab('sale'); return;
+        await reopen(ord);
+        say('لم يكتمل الدفع عبر فاتورة', 'no'); loadOrder(ord); return;
       }
       const v = await fatoraVerify({ orderId: ret.orderId, transactionId: ret.transactionId });
       if (v.ok && v.paid) {
         const pay = { method: 'fatora', amount: ord.pendingFatora.amount, ref: ret.paymentId || ret.transactionId || ret.orderId, at: nowISO(), fatora: ret };
         const done = await finalizeOrder({ ...ord, pendingFatora: null }, [...(ord.payments || []), pay]);
         say('تم الدفع عبر فاتورة ✓', 'ok');
-        setReceipt(done);
+        if (done.status === 'paid') setReceipt(done);
+      } else if (v.ok && !v.paid) {
+        // تأكيد قاطع بعدم السداد → أعد فتح الطلب وامسح الانتظار
+        await reopen(ord);
+        say('لم يكتمل الدفع عبر فاتورة', 'no'); loadOrder(ord);
       } else {
-        await commitOrders(list => upsert(list, { ...ord, pendingFatora: null, status: ord.lines.some(l => l.sentAt) ? 'sent' : 'held' }));
-        say(v.error || 'تعذّر تأكيد الدفع عبر فاتورة', 'no'); loadOrder(ord);
+        // خطأ عابر في التحقّق (شبكة/مهلة): نُبقي علامة الانتظار حتى لا يُشحن العميل مرتين
+        // ويبقى الطلب معلّقاً في «الطلبات» لإعادة التحقّق لاحقاً
+        say('تعذّر تأكيد الدفع الآن — الطلب محفوظ في «الطلبات» للمراجعة', 'no');
       }
     })();
   }, [ready]); // eslint-disable-line
@@ -376,9 +408,9 @@ function SaleScreen({ ctx }) {
     const newlySent = cart.lines.filter(l => !l.sentAt);
     if (!newlySent.length) { say('لا بنود جديدة للإرسال', 'no'); return; }
     const stamped = { ...cart, lines: cart.lines.map(l => l.sentAt ? l : { ...l, sentAt: nowISO() }), status: 'sent', sentAt: cart.sentAt || nowISO() };
-    setCart(stamped);
-    await persistOrder(stamped);
-    if (settings.autoKitchenPrint !== false) printKitchen(stamped, newlySent, settings.receiptSize);
+    const saved = await persistOrder(stamped);
+    setCart(saved);
+    if (settings.autoKitchenPrint !== false) printKitchen(saved, newlySent, settings.receiptSize);
     say('أُرسل للمطبخ ✓', 'ok');
   };
 
@@ -392,7 +424,7 @@ function SaleScreen({ ctx }) {
     if (!cart) return;
     if (!role.canVoid) { say('لا صلاحية للإلغاء', 'no'); return; }
     const reason = prompt('سبب الإلغاء؟'); if (reason == null) return;
-    if (cart.status && cart.status !== 'open') await commitOrders(list => upsert(list, { ...cart, status: 'void', voidReason: reason, closedAt: nowISO() }));
+    if (cart.status && cart.status !== 'open') await commitOrders(list => list.map(x => x.id === cart.id ? { ...x, status: 'void', voidReason: reason, closedAt: nowISO() } : x));
     say('أُلغي الطلب'); setCart(null);
   };
 
@@ -409,8 +441,9 @@ function SaleScreen({ ctx }) {
 
   const onPaid = async (payments) => {
     const done = await finalizeOrder(cart, payments);
-    setPay(false); setCart(null); setReceipt(done);
-    say('اكتمل الدفع ✓', 'ok');
+    setPay(false);
+    if (done.status === 'paid') { setCart(null); setReceipt(done); say('اكتمل الدفع ✓', 'ok'); }
+    else { setCart(done); say('دفعة مسجّلة — يتبقّى مبلغ على الطلب', 'no'); }
   };
 
   return (

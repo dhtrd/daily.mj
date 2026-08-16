@@ -129,8 +129,10 @@ export function PaymentModal({ ctx, order, onClose, onPaid }) {
 
   const startFatora = async () => {
     if (!fatoraReady) { say(fatoraEnabled ? 'الخادم بلا مفتاح فاتورة' : 'فعّل فاتورة من الإعدادات', 'no'); return; }
-    const payAmt = Math.min(amt || balance, balance);
-    if (payAmt <= 0) { say('مبلغ غير صالح', 'no'); return; }
+    // الدفع الإلكتروني يسدّد المتبقّي كاملاً (يمنع إغلاق فاتورة بسداد جزئي)؛
+    // للتقسيم: سجّل النقد/الشبكة أولاً ثم اختر فاتورة للباقي.
+    const payAmt = balance;
+    if (payAmt <= 0) { say('لا يوجد مبلغ متبقٍّ', 'no'); return; }
     const oid = fatoraOrderId(order);
     say('جارٍ إنشاء الدفع…');
     const res = await fatoraCheckout({ order, settings, amount: payAmt, orderId: oid });
@@ -222,12 +224,10 @@ export function PaymentModal({ ctx, order, onClose, onPaid }) {
           {method === 'fatora' && (
             <div style={{ padding: '10px 0' }}>
               {!fatoraReady && <div className="badge b-amber mb" style={{ display: 'flex' }}><AlertTriangle size={13} />{fatoraEnabled ? 'الخادم بلا مفتاح فاتورة (اضبط FATORA_API_KEY)' : 'الربط غير مفعّل — فعّله من الإعدادات'}</div>}
-              <Field label={`المبلغ (${cur})`}>
-                <input className="inp num" value={amount} onChange={e => setAmount(e.target.value.replace(/[^\d.]/g, ''))} />
-              </Field>
-              <div className="mut sm-txt mb">الوضع: {(settings.fatora?.mode) === 'link' ? 'رمز/رابط للعميل' : 'تحويل الجهاز لصفحة الدفع'}. يتم التحقّق من الدفع لدى فاتورة قبل اعتماد الفاتورة.</div>
-              <button className="btn pri lg block" disabled={!fatoraReady} onClick={startFatora}>
-                <QrCode size={17} />دفع عبر فاتورة · {money(Math.min(amt || balance, balance))} {cur}
+              <div className="pay-amount num">{money(balance)} <span style={{ fontSize: 16, color: 'var(--dim)' }}>{cur}</span></div>
+              <div className="mut sm-txt mb">يُسدَّد المبلغ المتبقّي كاملاً عبر فاتورة. الوضع: {(settings.fatora?.mode) === 'link' ? 'رمز/رابط للعميل' : 'تحويل الجهاز لصفحة الدفع'}. لا تُعتمد الفاتورة إلا بعد تأكيد السداد لدى فاتورة.</div>
+              <button className="btn pri lg block" disabled={!fatoraReady || balance <= 0} onClick={startFatora}>
+                <QrCode size={17} />دفع عبر فاتورة · {money(balance)} {cur}
               </button>
             </div>
           )}
@@ -424,7 +424,7 @@ export function OrdersScreen({ ctx }) {
   const refund = async (o) => {
     if (!role.canRefund) { say('لا صلاحية للاسترجاع', 'no'); return; }
     const reason = prompt('سبب الاسترجاع؟'); if (reason == null) return;
-    await commitOrders(list => upsert(list, { ...o, status: 'refunded', refundReason: reason, refundedAt: nowISO() }));
+    await commitOrders(list => list.map(x => x.id === o.id ? { ...x, status: 'refunded', refundReason: reason, refundedAt: nowISO() } : x));
     say('سُجّل الاسترجاع', 'ok');
   };
 
@@ -491,7 +491,8 @@ export function KitchenScreen({ ctx }) {
 
   const stationsPresent = [...new Set(tickets.flatMap(o => o.lines.filter(l => l.sentAt).map(l => l.station || 'kitchen')))];
 
-  const setStatus = (o, status) => commitOrders(list => upsert(list, { ...o, status }));
+  // دمج على مستوى الحقل: نُغيّر الحالة فقط على أحدث نسخة، فلا نطمس تعديلات الكاشير المتزامنة
+  const setStatus = (o, status) => commitOrders(list => list.map(x => x.id === o.id ? { ...x, status } : x));
 
   return (
     <div className="screen-pad">

@@ -169,7 +169,7 @@ function _qrB64(bytes) { let s = ''; for (let i = 0; i < bytes.length; i++) s +=
 /* رمز زاتكا للمرحلة الأولى: TLV (وسم-طول-قيمة) بترميز Base64 — 5 حقول إلزامية */
 export function zatcaTLV(seller, vatNo, tsISO, total, vatAmount) {
   const enc = new TextEncoder();
-  const tlv = (tag, valStr) => { const v = enc.encode(String(valStr == null ? '' : valStr)); const out = new Uint8Array(2 + v.length); out[0] = tag; out[1] = v.length; out.set(v, 2); return out; };
+  const tlv = (tag, valStr) => { let v = enc.encode(String(valStr == null ? '' : valStr)); if (v.length > 255) v = v.slice(0, 255); const out = new Uint8Array(2 + v.length); out[0] = tag; out[1] = v.length; out.set(v, 2); return out; };
   const parts = [tlv(1, seller), tlv(2, vatNo), tlv(3, tsISO), tlv(4, Number(total || 0).toFixed(2)), tlv(5, Number(vatAmount || 0).toFixed(2))];
   let len = 0; parts.forEach(p => len += p.length);
   const buf = new Uint8Array(len); let off = 0; parts.forEach(p => { buf.set(p, off); off += p.length; });
@@ -193,19 +193,21 @@ export const emitsZatca = (settings) => !!(settings && Number(settings.vatRate) 
 /* رمز ZATCA لفاتورة بيع مبسّطة → SVG جاهز للطباعة/العرض (سلسلة فارغة إن لم يكن مطبَّقاً) */
 export function zatcaQrSvg(order, settings, opts) {
   if (!emitsZatca(settings)) return '';
-  const t = computeOrder(order, settings);
+  const t = order.totals || computeOrder(order, settings);
   const seller = (settings.name || '').trim() || 'المطعم';
   const payload = zatcaTLV(seller, settings.vatNo || '', order.closedAt || order.createdAt || new Date().toISOString(), t.total, t.vat);
   return qrSvg(payload, opts);
 }
 
 /* ================= الإيصال الحراري (فاتورة ضريبية مبسّطة) ================= */
-const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// هروب كامل لسياق السمة (بما فيه علامات الاقتباس) لمنع كسر السمات/الحقن في نافذة الطباعة
+const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 export function receiptHTML(order, settings, opts = {}) {
   const size = opts.size === '58' ? '58' : '80';
   const PG = size === '58' ? 58 : 80, W = size === '58' ? 48 : 74;
-  const t = computeOrder(order, settings);
+  // نستخدم المجاميع المجمّدة وقت البيع إن وُجدت (فلا تتغيّر الفاتورة القديمة عند تعديل الإعدادات لاحقاً)
+  const t = order.totals || computeOrder(order, settings);
   const cur = curAr(settings.currency || 'SAR');
   const m = (n) => money(n);
   const ts = order.closedAt || order.createdAt || new Date().toISOString();
@@ -228,10 +230,12 @@ export function receiptHTML(order, settings, opts = {}) {
   const payRows = (order.payments || []).map(p => {
     const label = p.method === 'cash' ? 'نقداً' : p.method === 'card' ? 'شبكة (مدى/بطاقة)' : p.method === 'fatora' ? 'فاتورة (دفع إلكتروني)' : (p.label || p.method);
     const refTxt = p.ref ? ` · ${esc(String(p.ref))}` : '';
-    return `<tr><td>${label}${refTxt}</td><td class="v">${m(p.amount)}</td></tr>`;
+    // للنقد نعرض المبلغ المُستلَم فعلياً (المدفوع) إن سُجّل، وإلا المبلغ المطبَّق
+    const shown = p.method === 'cash' && p.tendered ? p.tendered : p.amount;
+    return `<tr><td>${label}${refTxt}</td><td class="v">${m(shown)}</td></tr>`;
   }).join('');
-  const paid = (order.payments || []).reduce((s, p) => s + (Number(p.amount) || 0), 0);
-  const change = Math.max(0, round2(paid - t.total));
+  // الباقي للعميل من الحقول المسجّلة على الدفعات (متسق مع شاشة الإيصال)
+  const change = round2((order.payments || []).reduce((s, p) => s + (Number(p.change) || 0), 0));
 
   const html = `<!doctype html><html dir="rtl" lang="ar"><head><meta charset="utf-8">
   <title>فاتورة ${esc(order.no || '')}</title><style>

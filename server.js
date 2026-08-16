@@ -81,22 +81,24 @@ function pickCheckoutUrl(data) {
     || data.url || '';
 }
 
-// استنتاج «مدفوعة» من استجابة التحقّق (فاتورة قد تختلف حقولها؛ نتحرّى بمرونة)
+// استنتاج «مدفوعة» من استجابة التحقّق — بحذر شديد.
+// مهم: الحقل الأعلى data.status هو حالة نداء الـAPI (نجح الطلب) لا حالة الدفع؛
+// لذا لا نعتمد عليه إطلاقاً، بل على حقول حالة الدفع/المعاملة داخل result فقط.
+// عند الغموض نعيد false (فالأأمن ألا نعتمد فاتورة دون تأكيد فعلي للسداد).
 function inferPaid(data) {
   if (!data || typeof data !== 'object') return false;
   const r = data.result || data;
   const strs = [];
   const push = (v) => { if (v != null) strs.push(String(v).toUpperCase()); };
-  push(data.status); push(r.status); push(r.payment_status); push(r.transaction_status); push(r.state); push(r.result);
-  const okWords = ['SUCCESS', 'PAID', 'APPROVED', 'CAPTURED', 'COMPLETED', 'SUCCESSFUL'];
-  if (strs.some(s => okWords.some(w => s.includes(w)))) {
-    // لا نعدّها مدفوعة لو ظهرت كلمة فشل صريحة مع النجاح
-    const bad = ['FAIL', 'DECLINE', 'CANCEL', 'ERROR', 'PENDING', 'EXPIRED'];
-    const explicitBad = strs.some(s => bad.some(w => s.includes(w)) && !okWords.some(w => s.includes(w)));
-    if (!explicitBad) return true;
-  }
-  // رمز استجابة ناجح شائع
-  const rc = r.response_code != null ? String(r.response_code) : (data.response_code != null ? String(data.response_code) : '');
+  // حقول حالة الدفع/المعاملة على مستوى النتيجة فقط (بلا غلاف الـAPI)
+  push(r.payment_status); push(r.transaction_status); push(r.paymentStatus); push(r.transactionStatus); push(r.state);
+  if (typeof r.status === 'string' && data.result) push(r.status); // status داخل result (لا الغلاف الأعلى)
+  const bad = ['FAIL', 'DECLINE', 'CANCEL', 'ERROR', 'PENDING', 'EXPIRED', 'INITIAT', 'UNPAID', 'VOID'];
+  if (strs.some(s => bad.some(w => s.includes(w)))) return false;
+  const okWords = ['PAID', 'APPROVED', 'CAPTURED', 'COMPLETED', 'SETTLED', 'SUCCESSFUL', 'SUCCESS'];
+  if (strs.some(s => okWords.some(w => s.includes(w)))) return true;
+  // رمز استجابة ناجح صريح على مستوى النتيجة
+  const rc = r.response_code != null ? String(r.response_code) : '';
   if (rc === '000' || rc === '0' || rc === '00') return true;
   return false;
 }
